@@ -1,0 +1,152 @@
+#!/usr/bin/env python
+
+import argparse
+import xarray as xr
+
+
+def recombine_datasets(dictArgs):
+    """ open splitted files as written by the model
+
+    PARAMETERS:
+    -----------
+    dictArgs: dictionary
+
+    RETURNS:
+    --------
+    ds: xarray dataset
+    """
+
+    ds = xr.open_mfdataset(dictArgs["infiles"], combine='by_coords',
+                           data_vars='minimal', decode_times=False)
+
+    # take care of re-chunking
+    chunks = {}
+    chunks['xh'] = set_chunk(ds, 'xh', dictArgs["x_chunk"])
+    chunks['yh'] = set_chunk(ds, 'yh', dictArgs["y_chunk"])
+
+    sym = 1 if dictArgs["symetric"] else 0
+    chunks['xq'] = set_chunk(ds, 'xq', dictArgs["x_chunk"] + sym)
+    chunks['yq'] = set_chunk(ds, 'yq', dictArgs["y_chunk"] + sym)
+
+    if 'zl' in ds.dims:
+        chunks['zl'] = set_chunk(ds, 'zl', dictArgs["z_chunk"])
+    if 'zi' in ds.dims:
+        chunks['zi'] = set_chunk(ds, 'zi', dictArgs["z_chunk"])
+
+    chunks['time'] = set_chunk(ds, 'time', dictArgs["time_chunk"])
+
+    ds = ds.chunk(chunks)
+    return ds
+
+
+def set_chunk(ds, dim, chunksize):
+    """ set the chunk size """
+    if dim in ds.dims:
+        if chunksize == 0:
+            chunksize = len(ds[dim])
+    return chunksize
+
+
+def write_recombined(ds, dictArgs):
+
+    # create the encoding
+    encoding = {}
+    for var in ds.variables:
+        encoding[var] = {'_FillValue': 1e+20}
+        #chunksvar = ds[var].chunks
+        #if chunksvar is not None:
+            #chunksizes = []
+            #for c in chunksvar:
+                #chunksizes.append(c[0])
+            #encoding[var]['chunksizes'] = chunksizes
+            #encoding[var]['contiguous'] = False
+
+    # write to zarr
+    if dictArgs["append"]:
+        ds.to_zarr(dictArgs["fileout"], mode='a',
+                   consolidated=True,
+                   append_dim='time')
+    else:
+        ds.to_zarr(dictArgs["fileout"], mode='w',
+                   encoding=encoding,
+                   consolidated=True)
+
+    return None
+
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(
+        description="recombine splitted outputs from model"
+    )
+    parser.add_argument(
+        "infiles",
+        metavar="input_files",
+        type=str,
+        nargs="+",
+        help="netcdf files to recombine",
+    )
+    parser.add_argument(
+        "-t",
+        "--time-chunk",
+        type=int,
+        default=0,
+        required=False,
+        help="time chunk",
+    )
+    parser.add_argument(
+        "-x",
+        "--x-chunk",
+        type=int,
+        default=0,
+        required=False,
+        help="x chunk",
+    )
+    parser.add_argument(
+        "-y",
+        "--y-chunk",
+        type=int,
+        default=0,
+        required=False,
+        help="y chunk",
+    )
+    parser.add_argument(
+        "-z",
+        "--z-chunk",
+        type=int,
+        default=0,
+        required=False,
+        help="z chunk",
+    )
+    parser.add_argument(
+        "--symetric",
+        type=bool,
+        default=False,
+        required=False,
+        help="symetric output",
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        required=False,
+        help="append to store",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default='',
+        required=True,
+        help="output store",
+    )
+
+    args = parser.parse_args()
+    dictArgs = vars(args)
+
+    # generate output file name from input
+    dictArgs["fileout"] = dictArgs["output"]
+    # read the data
+    ds = recombine_datasets(dictArgs)
+    # write the data
+    write_recombined(ds, dictArgs)
+
