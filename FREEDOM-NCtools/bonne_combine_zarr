@@ -3,6 +3,11 @@
 import argparse
 import xarray as xr
 
+possible_x_center = ['xh', 'xT', 'xB']
+possible_x_corner = ['xq', 'xTe']
+
+possible_y_center = ['yh', 'yT', 'yB']
+possible_y_corner = ['yq', 'yTe']
 
 def recombine_datasets(dictArgs):
     """ open splitted files as written by the model
@@ -19,19 +24,33 @@ def recombine_datasets(dictArgs):
     ds = xr.open_mfdataset(dictArgs["infiles"], combine='by_coords',
                            data_vars='minimal', decode_times=False)
 
-    # take care of re-chunking
     chunks = {}
-    chunks['xh'] = set_chunk(ds, 'xh', dictArgs["x_chunk"])
-    chunks['yh'] = set_chunk(ds, 'yh', dictArgs["y_chunk"])
+    # take care of re-chunking horizontal dimensions:
+    for vx in possible_x_center:
+        if vx in ds.dims:
+            chunks[vx] = set_chunk(ds, vx, dictArgs["x_chunk"])
+    for vy in possible_y_center:
+        if vy in ds.dims:
+            chunks[vy] = set_chunk(ds, vy, dictArgs["y_chunk"])
 
     sym = 1 if dictArgs["symetric"] else 0
-    chunks['xq'] = set_chunk(ds, 'xq', dictArgs["x_chunk"] + sym)
-    chunks['yq'] = set_chunk(ds, 'yq', dictArgs["y_chunk"] + sym)
 
+    for vx in possible_x_corner:
+        if vx in ds.dims:
+            chunks[vx] = set_chunk(ds, vx, dictArgs["x_chunk"] + sym)
+    for vy in possible_y_corner:
+        if vy in ds.dims:
+            chunks[vy] = set_chunk(ds, vy, dictArgs["y_chunk"] + sym)
+
+    # take care of re-chunking horizontal dimensions:
     if 'zl' in ds.dims:
         chunks['zl'] = set_chunk(ds, 'zl', dictArgs["z_chunk"])
     if 'zi' in ds.dims:
         chunks['zi'] = set_chunk(ds, 'zi', dictArgs["z_chunk"])
+    if 'rho2_l' in ds.dims:
+        chunks['rho2_l'] = set_chunk(ds, 'rho2_l', dictArgs["rho_chunk"])
+    if 'rho2_i' in ds.dims:
+        chunks['rho2_i'] = set_chunk(ds, 'rho2_i', dictArgs["rho_chunk"])
 
     chunks['time'] = set_chunk(ds, 'time', dictArgs["time_chunk"])
 
@@ -117,6 +136,14 @@ if __name__ == "__main__":
         default=0,
         required=False,
         help="z chunk",
+    )
+    parser.add_argument(
+        "-r",
+        "--rho-chunk",
+        type=int,
+        default=0,
+        required=False,
+        help="rho chunk",
     )
     parser.add_argument(
         "--symetric",
