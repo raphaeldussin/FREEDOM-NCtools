@@ -1,0 +1,321 @@
+#!/usr/bin/env python
+
+import xarray as xr
+import numpy as np
+from scipy.sparse import coo_matrix
+import argparse
+import warnings
+
+
+def read_esmf_weights(esmf_weights_file, nxy_src, nxy_dst):
+    """
+    Read regridding weights from ESMF produced file
+
+    Parameters
+    ----------
+
+    esmf_weights_file : str
+        file containing weights in ESMF format
+
+    nxy_src : int
+        number of horizontal points on source grid
+
+    nxy_dst : int
+        number of horizontal points on destination grid
+
+    Returns
+    -------
+
+    COO Sparse matrix of weights
+
+    """
+
+    wgts = xr.open_dataset(esmf_weights_file)
+    col = wgts["col"].values - 1  # F to C indexing
+    row = wgts["row"].values - 1
+    S = wgts["S"].values
+    return coo_matrix((S, (row, col)), shape=[nxy_dst, nxy_src])
+
+
+def convert_row_to_dst_ij(weights, nx_dst, ny_dst):
+    """
+    convert sparse COO row to (i,j)
+
+    Parameters
+    ----------
+
+    weights : scipy.sparse.coo_matrix
+        regridding weights sparse matrix
+
+    nx_dst : int
+        number of points in x-direction on destination grid
+
+    ny_dst : int
+        number of points in y-direction on destination grid
+
+    Returns
+    -------
+
+    a (N,2) numpy.array containing indexes (i, j) on dest grid
+
+    """
+
+    # S = weights.tocoo()
+    tmplist = []
+    for index in weights.row:
+        i, j = np.unravel_index(index, [nx_dst, ny_dst], order="F")
+        tmplist.append([i + 1, j + 1])  # convert to F indexing
+    out = np.array(tmplist)
+    return out
+
+
+def convert_col_to_src_ij(weights, nx_src, ny_src):
+    """
+    convert sparse COO col to (i,j)
+
+    Parameters
+    ----------
+
+    weights : scipy.sparse.coo_matrix
+        regridding weights sparse matrix
+
+    nx_src : int
+        number of points in x-direction on source grid
+
+    ny_src : int
+        number of points in y-direction on source grid
+
+    Returns
+    -------
+
+    a (N,2) numpy.array containing indexes (i, j) on source grid
+
+    """
+
+    # S = weights.tocoo()
+    tmplist = []
+    for index in weights.col:
+        i, j = np.unravel_index(index, [nx_src, ny_src], order="F")
+        tmplist.append([i + 1, j + 1])  # convert to F indexing
+    out = np.array(tmplist)
+    return out
+
+
+def multiply_weights_by_area(weights, dst_area, nx_dst, ny_dst):
+    """
+    Multiply ESMF weights by destination cell area to obtain suitable
+    weights for FREGRID
+
+    Parameters
+    ----------
+
+    weights : scipy.sparse.coo_matrix
+        regridding weights sparse matrix
+
+    dst_area : np.array
+        cell area on destination grid
+
+    nx_dst : int
+        number of points in x-direction on destination grid
+
+    ny_dst : int
+        number of points in y-direction on destination grid
+
+
+    Returns
+    -------
+
+    A scipy.sparse_coo_matrix with updated weights
+
+    """
+
+    # S = weights.tocoo()
+    arealist = []
+    for index in weights.row:
+        i, j = np.unravel_index(index, [nx_dst, ny_dst], order="F")
+        arealist.append(dst_area[j, i])
+    A = coo_matrix(
+        (np.array(arealist), (weights.row, weights.col)), shape=weights.shape
+    )
+    A2 = A.tocsr()
+    S2 = weights.tocsr()
+    U2 = S2.multiply(A2)
+    U = U2.tocoo()
+    return U.data
+
+
+def filter_nan(src_ij, dst_ij, xgrid_area):
+    """
+    remove NaNs from area vector: find NaNs in area vector and
+    remove corresponding (i,j) pairs in src and dst
+
+    src_ij, dst_ij: (N,2) numpy.array
+
+    xgrid_area: (N) numpy.array
+    """
+
+    remove_items = np.where(np.isnan(xgrid_area))
+    xgrid_area_out = np.delete(xgrid_area, remove_items)
+    src_ij_out = np.delete(src_ij, remove_items, axis=0)
+    dst_ij_out = np.delete(dst_ij, remove_items, axis=0)
+    return src_ij_out, dst_ij_out, xgrid_area_out
+
+
+def write_weights_FREGRID_format(src_ij, dst_ij, xgrid_area, fileout="fregrid_out.nc"):
+    """ write weights in the FREGRID format"""
+
+    ncells, two = src_ij.shape
+    ds = xr.Dataset()
+    ds["tile1"] = xr.DataArray(
+        np.ones(ncells),
+        dims=("ncells"),
+        attrs={"standard_name": "tile_number_in_mosaic1"},
+    )
+    ds["tile1_cell"] = xr.DataArray(
+        src_ij,
+        dims=("ncells", "two"),
+        attrs={"standard_name": "parent_cell_indices_in_mosaic1"},
+    )
+    ds["tile2_cell"] = xr.DataArray(
+        dst_ij,
+        dims=("ncells", "two"),
+        attrs={"standard_name": "parent_cell_indices_in_mosaic2"},
+    )
+    ds["xgrid_area"] = xr.DataArray(
+        xgrid_area,
+        dims=("ncells"),
+        attrs={"standard_name": "exchage_grid_area", "units": "m2"},
+    )
+    encoding = {
+        "tile1": {"dtype": np.int},
+        "tile1_cell": {"dtype": np.int},
+        "tile2_cell": {"dtype": np.int},
+        "xgrid_area": {"dtype": np.double, "_FillValue": 1e20},
+    }
+    ds.to_netcdf(fileout, encoding=encoding, format="NETCDF3_64BIT", engine="netcdf4")
+    return None
+
+
+def convert_weights(
+    esmf_weights_file="",
+    nx_src=0,
+    ny_src=0,
+    nx_dst=0,
+    ny_dst=0,
+    areafile="",
+    areavar="",
+    fileout="",
+):
+    """
+    Convert regridding weights from ESMF to FRE
+
+    Parameters
+    ----------
+
+    esmf_weights_file : str
+        file containing regridding weights in ESMF format
+
+    nx_src, ny_src : int
+        horizontal dimensions of source grid
+
+    nx_dst, ny_dst : int
+        horizontal dimensions of destination grid
+
+    areafile : str
+        file containing area of destination grid
+
+    areavar: str
+        name of variable for area grid
+
+    fileout: str
+        name of output weights file
+    """
+
+    nxy_src = nx_src * ny_src
+    nxy_dst = nx_dst * ny_dst
+
+    dst_area = xr.open_dataset(areafile)[areavar].values
+
+    # read weights from file
+    weights = read_esmf_weights(esmf_weights_file, nxy_src, nxy_dst)
+    # read indexes for src grid
+    tile1_cell = convert_col_to_src_ij(weights, nx_src, ny_src)
+    # read indexes for dst grid
+    tile2_cell = convert_row_to_dst_ij(weights, nx_dst, ny_dst)
+    # update weights with dst cell areas
+    xgrid_area = multiply_weights_by_area(weights, dst_area, nx_dst, ny_dst)
+    # remove NaNs from arrays
+    tile1_cell, tile2_cell, xgrid_area = filter_nan(tile1_cell, tile2_cell, xgrid_area)
+    # write to netcdf file
+    write_weights_FREGRID_format(tile1_cell, tile2_cell, xgrid_area, fileout=fileout)
+
+    return None
+
+
+if __name__ == "__main__":
+
+    warnings.filterwarnings("ignore")
+
+    parser = argparse.ArgumentParser(
+        description="ESMF regridding weights conversion to FREGRID"
+    )
+
+    parser.add_argument(
+        "esmf_weights_file",
+        metavar="esmf_weights_file",
+        type=str,
+        help="Regridding weights in the ESMF format",
+    )
+    parser.add_argument(
+        "--nx_src",
+        type=int,
+        required=True,
+        help="number of points in x-direction on source grid",
+    )
+    parser.add_argument(
+        "--ny_src",
+        type=int,
+        required=True,
+        help="number of points in y-direction on source grid",
+    )
+    parser.add_argument(
+        "--nx_dst",
+        type=int,
+        required=True,
+        help="number of points in x-direction on destination grid",
+    )
+    parser.add_argument(
+        "--ny_dst",
+        type=int,
+        required=True,
+        help="number of points in y-direction on destination grid",
+    )
+    parser.add_argument(
+        "--areafile",
+        type=str,
+        required=True,
+        help="netcdf file containing area on destination grid",
+    )
+    parser.add_argument(
+        "--areavar",
+        type=str,
+        required=False,
+        default="areacello",
+        help="name of variable for area on destination grid",
+    )
+    parser.add_argument(
+        "-o",
+        "--fileout",
+        type=str,
+        required=False,
+        default="regrid_weights_FREGRID.nc",
+        help="name of output weights in FREGRID format",
+    )
+
+    args = vars(parser.parse_args())
+
+    convert_weights(**args)
+
+    print(
+        f"--- esmf2fre: Successfully created {args['fileout']} \N{clinking beer mugs}---"
+    )
